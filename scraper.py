@@ -309,6 +309,54 @@ def extract_essentials(product: dict):
 # SINGLE-PRODUCT (PDP) STOCK EXTRACTION
 # --------------------------------------------------------------------------
 
+def _extract_balanced_json(html: str, var_name: str):
+    """
+    Finds `<var_name> = { ... }` in a page and returns the JSON object text
+    by counting braces (respecting string literals/escapes), instead of a
+    regex that can stop too early or swallow trailing content. Returns None
+    if the variable/object can't be located.
+    """
+    marker_idx = html.find(var_name)
+    if marker_idx == -1:
+        return None
+
+    brace_start = html.find("{", marker_idx)
+    if brace_start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    string_char = ""
+    escaped = False
+
+    i = brace_start
+    n = len(html)
+    while i < n:
+        ch = html[i]
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == string_char:
+                in_string = False
+        else:
+            if ch in ('"', "'"):
+                in_string = True
+                string_char = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return html[brace_start:i + 1]
+
+        i += 1
+
+    return None  # unbalanced - never closed
+
+
 def parse_pdp_stock(html: str, url: str):
     """
     Parses a Myntra product-detail page's embedded JSON blob and returns:
@@ -320,19 +368,21 @@ def parse_pdp_stock(html: str, url: str):
     if not html:
         return None
 
-    m = re.search(r"window\.__myx\s*=\s*(\{.*?\});\s*\n", html, re.DOTALL)
-    if not m:
-        # fallback for slightly different minified formatting
-        m = re.search(r"window\.__myx\s*=\s*(\{.*\})\s*</script>", html, re.DOTALL)
-    if not m:
+    raw_json = _extract_balanced_json(html, "window.__myx")
+    if raw_json is None:
         print("  [PDP] Could not find window.__myx blob - Myntra page structure may have changed.",
               file=sys.stderr)
         return None
 
     try:
-        data = json.loads(m.group(1))
+        data = json.loads(raw_json)
     except json.JSONDecodeError as e:
         print(f"  [PDP] Failed to parse __myx JSON: {e}", file=sys.stderr)
+        if DEBUG_RAW:
+            # Show a window around the failure point to help diagnose.
+            pos = e.pos if hasattr(e, "pos") else 0
+            snippet = raw_json[max(0, pos - 80):pos + 80]
+            print(f"[DEBUG pdp json around failure]: ...{snippet}...", file=sys.stderr)
         return None
 
     if DEBUG_RAW:
