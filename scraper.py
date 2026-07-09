@@ -2,13 +2,24 @@
 """
 Myntra Back-in-Stock Monitor (API method, no Selenium/browser)
 ================================================================
-Same fetching/pagination/parsing engine as the price monitor's scraper.py.
-The only thing that's different is what we do with the results:
+Same fetching/pagination/parsing engine as the price monitor's scraper.py,
+PLUS a separate path for single-product (PDP) URLs.
 
-  Myntra's search/listing API only returns products that are currently
-  sellable. So "back in stock" == a product_id that we'd previously marked
-  out_of_stock (because it vanished from the listing) showing up in the
-  listing again.
+Two kinds of links are supported now:
+
+  1) CATEGORY / LISTING URLs
+     Myntra's search/listing API only returns products that are currently
+     sellable. So "back in stock" == a product_id that we'd previously
+     marked out_of_stock (because it vanished from the listing) showing up
+     in the listing again.
+
+  2) SINGLE-PRODUCT (PDP) URLs, e.g.
+     https://www.myntra.com/Sweaters/H%26M/HM-.../36212189/buy
+     These don't work against the search gateway (it 404s - there's no
+     "listing" for a single product). Instead we fetch the product page
+     directly and read its stock status from the embedded JSON
+     (window.__myx / pdpData.sizes). "Back in stock" here means the
+     in_stock flag flipped from False -> True.
 
 Persistence (who's in stock, who isn't) lives in Postgres - see app.py.
 """
@@ -18,6 +29,7 @@ import csv
 import json
 import os
 import random
+import re
 import sys
 import time
 import traceback
@@ -41,6 +53,11 @@ HEADERS = {
     "x-requested-with": "browser"
 }
 
+PDP_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://www.myntra.com/",
+}
+
 PRODUCTS_PER_PAGE = 50
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
@@ -49,9 +66,11 @@ MAX_PAGES_SAFETY = 200
 
 DEBUG_RAW = os.getenv("DEBUG_RAW", "0") == "1"
 
+_PDP_PATTERN = re.compile(r"/(\d+)/buy/?$")
+
 
 # --------------------------------------------------------------------------
-# URL -> API PARAMETER TRANSLATION
+# URL -> API PARAMETER TRANSLATION (category/listing URLs)
 # --------------------------------------------------------------------------
 
 def parse_myntra_url(url: str):
@@ -71,6 +90,20 @@ def parse_myntra_url(url: str):
 
 def build_api_url(category_path: str):
     return f"{API_BASE}/{category_path}"
+
+
+# --------------------------------------------------------------------------
+# SINGLE-PRODUCT (PDP) URL DETECTION
+# --------------------------------------------------------------------------
+
+def is_product_url(url: str) -> bool:
+    """True if this is a single-product page, e.g. .../HM-Jumper/36212189/buy"""
+    return bool(_PDP_PATTERN.search(urlparse(url).path))
+
+
+def extract_style_id(url: str):
+    m = _PDP_PATTERN.search(urlparse(url).path)
+    return m.group(1) if m else None
 
 
 # --------------------------------------------------------------------------
@@ -184,6 +217,27 @@ def fetch_page(session, category_path, base_params, page_number, progress_callba
     return "FETCH_FAILED:" + (last_err or "unknown error")
 
 
+def fetch_product_page(session, url, progress_callback=None):
+    """GET a single-product (PDP) page and return raw HTML, or None on failure."""
+    warm_up_session(session, progress_callback)
+
+    last_err = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = session.get(url, headers=PDP_HEADERS, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 200:
+                return resp.text
+            last_err = f"HTTP {resp.status_code}"
+        except RequestsError as e:
+            last_err = str(e)
+
+        print(f"  [pdp retry {attempt}/{MAX_RETRIES}] {last_err}", file=sys.stderr)
+        time.sleep(2 * attempt)
+
+    print(f"  [PDP FAILED] {url}: {last_err}", file=sys.stderr)
+    return None
+
+
 def extract_products(api_response):
     if not api_response:
         return [], 0
@@ -209,7 +263,7 @@ def extract_products(api_response):
 
 
 # --------------------------------------------------------------------------
-# ESSENTIAL FIELD EXTRACTION
+# ESSENTIAL FIELD EXTRACTION (category/listing rows)
 # --------------------------------------------------------------------------
 
 def first_present(d, keys, default=None):
@@ -252,7 +306,104 @@ def extract_essentials(product: dict):
 
 
 # --------------------------------------------------------------------------
-# SCRAPE LOGIC (pagination + auto-split, unchanged from price monitor)
+# SINGLE-PRODUCT (PDP) STOCK EXTRACTION
+# --------------------------------------------------------------------------
+
+def parse_pdp_stock(html: str, url: str):
+    """
+    Parses a Myntra product-detail page's embedded JSON blob and returns:
+        {product_id, brand, product_name, product_link, in_stock}
+    or None if parsing failed (caller should treat this run as inconclusive,
+    NOT as "out of stock" - we never want to alert/flip status based on a
+    parse failure).
+    """
+    if not html:
+        return None
+
+    m = re.search(r"window\.__myx\s*=\s*(\{.*?\});\s*\n", html, re.DOTALL)
+    if not m:
+        # fallback for slightly different minified formatting
+        m = re.search(r"window\.__myx\s*=\s*(\{.*\})\s*</script>", html, re.DOTALL)
+    if not m:
+        print("  [PDP] Could not find window.__myx blob - Myntra page structure may have changed.",
+              file=sys.stderr)
+        return None
+
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError as e:
+        print(f"  [PDP] Failed to parse __myx JSON: {e}", file=sys.stderr)
+        return None
+
+    if DEBUG_RAW:
+        print("[DEBUG pdp __myx top-level keys]:", list(data.keys()), file=sys.stderr)
+
+    pdp = data.get("pdpData") or data.get("pdp") or {}
+    if not pdp:
+        print("  [PDP] No pdpData key found in __myx - top-level keys were:",
+              list(data.keys()), file=sys.stderr)
+        return None
+
+    if DEBUG_RAW:
+        print("[DEBUG pdp pdpData keys]:", list(pdp.keys()), file=sys.stderr)
+
+    product_id = str(pdp.get("id") or pdp.get("styleId") or extract_style_id(url) or "")
+    name = pdp.get("name") or pdp.get("productName") or ""
+    brand = pdp.get("brand") or {}
+    if isinstance(brand, dict):
+        brand = brand.get("name", "")
+
+    sizes = pdp.get("sizes") or []
+    if not sizes:
+        print("  [PDP] pdpData had no 'sizes' array - dumping pdpData keys for debugging:",
+              list(pdp.keys()), file=sys.stderr)
+        return None
+
+    in_stock = False
+    for s in sizes:
+        available = s.get("available")
+        quantity = s.get("quantity") or s.get("stockCount") or 0
+        seller_count = s.get("sellerCount")
+        if available is True or (isinstance(quantity, (int, float)) and quantity > 0) or \
+           (isinstance(seller_count, (int, float)) and seller_count > 0):
+            in_stock = True
+            break
+
+    return {
+        "product_id": product_id,
+        "brand": brand,
+        "product_name": name,
+        "product_link": url,
+        "in_stock": in_stock,
+    }
+
+
+def check_single_product(session, url, title="", progress_callback=None):
+    print(f"\n=== Checking single product: {url} ===")
+    if progress_callback:
+        progress_callback(f"Checking product page: {url[:60]}...")
+
+    html = fetch_product_page(session, url, progress_callback)
+    result = parse_pdp_stock(html, url)
+
+    if result is None:
+        msg = "  [PDP] Could not determine stock status this run (parse failure) - skipping."
+        print(msg, file=sys.stderr)
+        if progress_callback:
+            progress_callback(msg)
+        return None
+
+    result["_source_title"] = title
+    result["_source_url"] = url
+    status = "IN STOCK" if result["in_stock"] else "out of stock"
+    print(f"  Status: {status}")
+    if progress_callback:
+        progress_callback(f"Product status: {status}")
+    return result
+
+
+# --------------------------------------------------------------------------
+# SCRAPE LOGIC (pagination + auto-split, category/listing URLs)
 # --------------------------------------------------------------------------
 
 def _paginate_one_range(session, category_path, params, url, title, progress_callback=None):
@@ -378,6 +529,21 @@ def _scrape_with_auto_split(session, category_path, params, url, title, progress
 
 
 def scrape_url(session, url, title="", progress_callback=None):
+    """
+    Returns (rows, blocked, is_single_product).
+
+    - For category/listing URLs: rows is a list of {product_id, brand,
+      product_name, product_link, _source_title, _source_url} dicts, with NO
+      'in_stock' key (stock is inferred later by presence/absence in the list).
+    - For single-product URLs: rows is a list of 0 or 1 dict that INCLUDES an
+      explicit 'in_stock' boolean, since there's no list to infer it from.
+    """
+    url = url.strip()
+
+    if is_product_url(url):
+        result = check_single_product(session, url, title, progress_callback)
+        return ([result] if result else []), False, True
+
     print(f"\n=== Scraping: {url} ===")
     if progress_callback:
         progress_callback(f"Connecting to: {url[:60]}...")
@@ -389,7 +555,7 @@ def scrape_url(session, url, title="", progress_callback=None):
         print(msg, file=sys.stderr)
         if progress_callback:
             progress_callback(msg)
-        return [], False
+        return [], False, False
 
     all_products, blocked, _ = _scrape_with_auto_split(
         session, category_path, params, url, title, progress_callback
@@ -402,7 +568,7 @@ def scrape_url(session, url, title="", progress_callback=None):
     if progress_callback:
         progress_callback(finish_msg)
 
-    return all_products, blocked
+    return all_products, blocked, False
 
 
 def scrape_all(urls, progress_callback=None):
@@ -412,6 +578,7 @@ def scrape_all(urls, progress_callback=None):
     session = requests.Session(impersonate="chrome110")
 
     all_rows = []
+    single_product_rows = []
     blocked_urls = []
     total_urls = len(urls)
 
@@ -424,13 +591,18 @@ def scrape_all(urls, progress_callback=None):
         if progress_callback:
             progress_callback(f"Starting Link {idx} of {total_urls}...")
 
-        rows, blocked = scrape_url(session, url.strip(), title, progress_callback)
-        all_rows.extend(rows)
+        rows, blocked, is_single = scrape_url(session, url.strip(), title, progress_callback)
+
+        if is_single:
+            single_product_rows.extend(rows)
+        else:
+            all_rows.extend(rows)
+
         if blocked:
             blocked_urls.append(url.strip())
         time.sleep(random.uniform(*DELAY_RANGE))
 
-    return all_rows, blocked_urls
+    return all_rows, single_product_rows, blocked_urls
 
 
 # --------------------------------------------------------------------------
@@ -457,15 +629,66 @@ def write_csv(rows, path):
 # `known` is a dict: { product_id: {"product_name":.., "product_link":.., .., "in_stock": bool} }
 # loaded from / saved to Postgres in app.py.
 #
-# Rule (per your spec): a product counts as "back in stock" any time it
-# reappears in the listing/search results at all - i.e. it was previously
-# marked in_stock=False (because a prior run didn't see it) and now shows
-# up again. Brand-new products we've never seen before are just recorded,
-# not alerted, since there's nothing to "come back" from.
+# CATEGORY/LISTING rows (no explicit 'in_stock' key):
+#   Rule: a product counts as "back in stock" any time it reappears in the
+#   listing/search results at all - i.e. it was previously marked
+#   in_stock=False (because a prior run didn't see it) and now shows up
+#   again. Brand-new products we've never seen before are just recorded,
+#   not alerted, since there's nothing to "come back" from. A tracked
+#   product that WAS in_stock but is missing from this run is marked OOS.
+#
+# SINGLE-PRODUCT rows (have an explicit 'in_stock' key):
+#   Rule: use the explicit in_stock flag directly. "Back in stock" = flag
+#   flipped False -> True since the last run. There's no "disappeared from
+#   a list" concept here - the product page either says in stock or not.
 
-def detect_stock_changes(rows, known):
+def detect_stock_changes(rows, single_product_rows, known):
     now = datetime.now().isoformat(timespec="seconds")
 
+    back_in_stock = []
+    newly_out_of_stock = []
+
+    # -----------------------------
+    # 1) SINGLE-PRODUCT rows first
+    # -----------------------------
+    single_ids_seen = set()
+    for row in single_product_rows:
+        pid = row.get("product_id")
+        if not pid:
+            continue
+        single_ids_seen.add(pid)
+
+        prev = known.get(pid)
+        currently_in_stock = row.get("in_stock", False)
+
+        if currently_in_stock and prev is not None and prev.get("in_stock") is False:
+            back_in_stock.append({
+                "title": row.get("_source_title", ""),
+                "product_name": row.get("product_name"),
+                "product_link": row.get("product_link"),
+                "brand": row.get("brand", ""),
+            })
+        elif (not currently_in_stock) and prev is not None and prev.get("in_stock") is True:
+            newly_out_of_stock.append({
+                "product_name": prev.get("product_name") or row.get("product_name"),
+                "product_link": prev.get("product_link") or row.get("product_link"),
+                "brand": prev.get("brand") or row.get("brand", ""),
+                "title": prev.get("source_title") or row.get("_source_title", ""),
+            })
+
+        known[pid] = {
+            "product_name": row.get("product_name"),
+            "product_link": row.get("product_link"),
+            "brand": row.get("brand", ""),
+            "source_title": row.get("_source_title", ""),
+            "in_stock": currently_in_stock,
+            "last_seen": now,
+            "kind": "single_product",
+        }
+
+    # -----------------------------
+    # 2) CATEGORY/LISTING rows
+    # -----------------------------
     current_by_id = {}
     for row in rows:
         pid = row.get("product_id")
@@ -473,10 +696,6 @@ def detect_stock_changes(rows, known):
             continue
         current_by_id[str(pid)] = row
 
-    back_in_stock = []
-    newly_out_of_stock = []
-
-    # 1) Anything present in this run
     for pid, row in current_by_id.items():
         prev = known.get(pid)
         if prev is not None and prev.get("in_stock") is False:
@@ -493,10 +712,15 @@ def detect_stock_changes(rows, known):
             "source_title": row.get("_source_title", ""),
             "in_stock": True,
             "last_seen": now,
+            "kind": "listing",
         }
 
-    # 2) Anything that WAS in_stock but is missing from this run -> now OOS
+    # Anything that WAS in_stock (from a listing) but is missing from this
+    # run's listing results -> now OOS. Skip single-product-tracked items,
+    # those were already handled explicitly above.
     for pid, prev in known.items():
+        if prev.get("kind") == "single_product":
+            continue
         if pid in current_by_id:
             continue
         if prev.get("in_stock") is True:
@@ -509,7 +733,8 @@ def detect_stock_changes(rows, known):
             prev["in_stock"] = False
             prev["last_out_of_stock"] = now
 
-    print(f"[diag] scraped_rows={len(rows)} | tracked_products={len(known)} "
+    total_scraped = len(rows) + len(single_product_rows)
+    print(f"[diag] scraped_rows={total_scraped} | tracked_products={len(known)} "
           f"| back_in_stock={len(back_in_stock)} | newly_oos={len(newly_out_of_stock)}",
           file=sys.stderr)
 
@@ -571,12 +796,12 @@ def run_once(urls, progress_callback=None, load_known=None, save_known=None, ale
     if progress_callback:
         progress_callback("Initializing run sequence...")
 
-    rows, blocked_urls = scrape_all(urls, progress_callback)
+    rows, single_product_rows, blocked_urls = scrape_all(urls, progress_callback)
 
     if progress_callback:
         progress_callback("Writing data to CSV backup...")
     try:
-        write_csv(rows, config.CSV_OUTPUT_PATH)
+        write_csv(rows + single_product_rows, config.CSV_OUTPUT_PATH)
     except Exception as e:
         print(f"[warning] CSV write failed: {e}", file=sys.stderr)
 
@@ -586,7 +811,7 @@ def run_once(urls, progress_callback=None, load_known=None, save_known=None, ale
 
     if progress_callback:
         progress_callback("Detecting restocks against known status...")
-    back_in_stock, newly_oos, known = detect_stock_changes(rows, known)
+    back_in_stock, newly_oos, known = detect_stock_changes(rows, single_product_rows, known)
 
     if save_known:
         save_known(known)
@@ -595,7 +820,7 @@ def run_once(urls, progress_callback=None, load_known=None, save_known=None, ale
         progress_callback(f"Sending alerts: {len(back_in_stock)} restocked...")
     send_alerts(back_in_stock, alert_callback=alert_callback)
 
-    return rows, back_in_stock, newly_oos, blocked_urls
+    return rows + single_product_rows, back_in_stock, newly_oos, blocked_urls
 
 
 # --------------------------------------------------------------------------
@@ -623,8 +848,8 @@ def load_urls_from_file(path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Monitor Myntra listings for restocked items.")
-    parser.add_argument("urls", nargs="*", help="Myntra listing URL(s); overrides links.txt if given")
+    parser = argparse.ArgumentParser(description="Monitor Myntra listings/products for restocked items.")
+    parser.add_argument("urls", nargs="*", help="Myntra listing or product URL(s); overrides links.txt if given")
     parser.add_argument("--links-file", default="links.txt", help="Path to file with one Myntra URL per line")
     parser.add_argument("--once", action="store_true", help="Run a single check and exit (no loop)")
     args = parser.parse_args()
