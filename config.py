@@ -3,14 +3,14 @@ import os
 # --------------------------------------------------------------------------
 # CONTROL BOT - the one you talk to: /menu, add/remove links, status, etc.
 # --------------------------------------------------------------------------
-CONTROL_BOT_TOKEN = os.environ["CONTROL_BOT_TOKEN"]
-CONTROL_CHAT_ID = os.environ["CONTROL_CHAT_ID"]
+CONTROL_BOT_TOKEN = os.environ["8676436769:AAGAc99V8-aepu40ATzNMJrVZwAo7SviIUo"]
+CONTROL_CHAT_ID = os.environ["5871058233"]
 
 # --------------------------------------------------------------------------
 # ALERT BOT - purely sends "back in stock" pings, no commands processed here
 # --------------------------------------------------------------------------
-ALERT_BOT_TOKEN = os.environ["ALERT_BOT_TOKEN"]
-ALERT_CHAT_ID = os.environ["ALERT_CHAT_ID"]
+ALERT_BOT_TOKEN = os.environ["8676436769:AAGAc99V8-aepu40ATzNMJrVZwAo7SviIUo"]
+ALERT_CHAT_ID = os.environ["5871058233"]
 
 # --------------------------------------------------------------------------
 # DATABASE
