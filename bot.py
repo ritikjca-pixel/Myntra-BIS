@@ -263,6 +263,22 @@ def send_restock_alerts(back_in_stock_items):
         time.sleep(0.5)
 
 
+def send_test_alert():
+    """
+    Fires ONE fake 'back in stock' message through the real alert bot /
+    alert chat, using dummy product data. Lets you confirm ALERT_BOT_TOKEN
+    and ALERT_CHAT_ID are correctly wired end-to-end, without waiting for
+    a real restock to happen.
+    """
+    dummy_item = {
+        "title": "TEST",
+        "brand": "Test Brand",
+        "product_name": "This is a manual test alert - ignore",
+        "product_link": "https://www.myntra.com/",
+    }
+    send_restock_alerts([dummy_item])
+
+
 # --------------------------------------------------------------------------
 # SHARED BOT STATE
 # --------------------------------------------------------------------------
@@ -299,6 +315,7 @@ Use the buttons below the menu, or these commands directly:
 /add [Title |] URL - add a new link
 /remove N - remove link number N (see /list)
 /checknow - force an immediate cycle
+/testalert - send a dummy restock alert via the ALERT bot, to confirm delivery works
 /help - show this message"""
 
 
@@ -313,6 +330,7 @@ def main_menu_keyboard():
          {"text": "Add Link", "callback_data": "add"}],
         [{"text": "Remove Link", "callback_data": "remove"},
          {"text": "Out of Stock", "callback_data": "oos"}],
+        [{"text": "Test Alert", "callback_data": "testalert"}],
         [{"text": "Help", "callback_data": "help"}],
     ]
 
@@ -461,6 +479,16 @@ def handle_callback(update):
     elif data == "help":
         tg_edit(token, chat_id, message_id, HELP_TEXT, back_to_menu_keyboard())
 
+    elif data == "testalert":
+        try:
+            send_test_alert()
+            tg_edit(token, chat_id, message_id,
+                    "Test alert sent via the ALERT bot. Check that chat now.\n\n"
+                    "If nothing arrived, ALERT_BOT_TOKEN or ALERT_CHAT_ID is wrong.",
+                    back_to_menu_keyboard())
+        except Exception as e:
+            tg_edit(token, chat_id, message_id, f"Test alert failed to send: {e}", back_to_menu_keyboard())
+
     elif data == "add":
         _convo_state[str(chat_id)] = {"action": "awaiting_add"}
         tg_edit(token, chat_id, message_id, add_usage_text(), back_to_menu_keyboard())
@@ -524,6 +552,15 @@ def handle_text_message(chat_id, text: str):
     elif cmd == "/checknow":
         check_now_flag["requested"] = True
         tg_send(token, chat_id, "Check requested - next cycle starts shortly.", back_to_menu_keyboard())
+    elif cmd == "/testalert":
+        try:
+            send_test_alert()
+            tg_send(token, chat_id,
+                    "Test alert sent via the ALERT bot. Check that chat now.\n\n"
+                    "If nothing arrived, ALERT_BOT_TOKEN or ALERT_CHAT_ID is wrong.",
+                    back_to_menu_keyboard())
+        except Exception as e:
+            tg_send(token, chat_id, f"Test alert failed to send: {e}", back_to_menu_keyboard())
     elif cmd == "/add":
         if not rest:
             tg_send(token, chat_id, add_usage_text())
